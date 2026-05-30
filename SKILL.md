@@ -34,16 +34,23 @@ Review a set of Claude memory `.md` files (by default in `~/.claude/projects/-Us
 7. Do not modify memory files unless the user explicitly confirms
 8. If modifications are needed, output only unified diff patches
 9. If more than `max-files` are found, stop and ask for confirmation
-10. If suspected sensitive content is detected, stop and ask for confirmation
+10. If suspected sensitive content is detected, **block the file** and continue audit — do not stop the entire audit
+11. Blocked files: do not output matched content, do not output surrounding context, do not generate patches for blocked files
 
 ## 4. Budget Limits
 
 | Resource | Limit |
 |----------|-------|
 | LLM inference calls | ≤ 1 |
-| File read/write operations | ≤ 3 (metadata-only reads by script) |
+| File I/O batches | ≤ 3 |
 | Output length | ≤ 300 lines |
 | Strategy | Prefer local script for structured scan, then feed metadata to LLM |
+
+**File I/O batch definition:**
+- Batch reading `memory/*.md` counts as **1 read group** (reading 6 files in one batch is not 6 separate violations)
+- Optionally writing one audit report file counts as **1 write group**
+- Optionally writing one patch file counts as **1 write group**
+- Total I/O batches = read groups + write groups
 
 Priority: local script > structured metadata > LLM judgement. Minimise what the LLM sees.
 
@@ -59,6 +66,15 @@ Priority: local script > structured metadata > LLM judgement. Minimise what the 
 flow: audit_memory.py (raw access) → JSON metadata → LLM analysis → audit report
 ```
 
+**Strict Local Audit boundaries:**
+- Do not output real filenames
+- Do not output real file paths
+- Do not output original text content
+- Do not output long summaries
+- Do not generate real unified diffs
+- Only output **patch intentions** (what needs to change and why, without real paths/content)
+- If real file paths are needed for modification, require the user to explicitly enter Patch Mode
+
 ### 5.2 Practical Claude Code Audit (fallback)
 
 When the Python script cannot be executed (no Python, permission denied, etc.):
@@ -70,14 +86,54 @@ When the Python script cannot be executed (no Python, permission denied, etc.):
 5. Do not read full file bodies
 6. Follow the same output format and privacy rules
 
+### 5.3 Patch Mode
+
+Patch Mode is a higher-privilege mode for generating actionable file modifications.
+
+**Entry conditions (ALL must be satisfied):**
+- User explicitly confirms entering Patch Mode
+- Script runs with `--include-filenames=true`
+- No unresolved sensitive content in any file
+- No blocked files remaining
+- All stop conditions resolved
+
+**Patch Mode rules:**
+- Only generate diffs within user-confirmed scope
+- All proposed modifications must be in unified diff format
+- Every diff must be accompanied by a rationale
+- No diffs are applied automatically — user must explicitly confirm each one
+- Each diff must be scoped to a single change (one concern per diff)
+
+### 5.4 Secure Redaction Mode
+
+Secure Redaction Mode is a restricted mode for handling blocked files that contain sensitive content (API keys, tokens, secrets, credentials).
+
+**Entry conditions (ALL must be satisfied):**
+- User explicitly confirms entering Secure Redaction Mode
+- Blocked files have been identified and confirmed by the user
+- Backup of blocked files has been created (`.backup/<timestamp>/`)
+
+**Secure Redaction Mode rules:**
+- Do NOT output original secret/credential values
+- Do NOT generate unified diffs that contain original secret values
+- Only replace matched sensitive values with `***`
+- For entire `.env.local` / credential code blocks, replace with redacted placeholder and note
+- Must create backup or ensure rollback capability before any modification
+- After redaction, re-run `audit_memory.py` to verify block is cleared
+- Never output matched content, surrounding context, or original values to terminal
+
 ## 6. Audit Checklist
 
 For each file, check:
 
 - [ ] Frontmatter exists with valid YAML
-- [ ] Required keys present: `name`, `description`, `type`
+- [ ] Required keys present: `type`, `status`, `updated`
 - [ ] `type` is one of: `user`, `feedback`, `project`, `reference`
+- [ ] `status` is one of: `active`, `archived`, `deprecated`, `needs-review`
+- [ ] `updated` field is present if `status` is `active` or `current`
 - [ ] `description` is non-empty and accurate for the content
+- [ ] `tags` present (low risk if missing)
+- [ ] Each non-index file has at least one h2 heading
 - [ ] Index entry in `MEMORY.md` matches filename
 - [ ] Index description matches frontmatter `description`
 - [ ] Cross-references between files resolve to existing files
@@ -88,6 +144,27 @@ For each file, check:
 - [ ] No broken markdown links
 - [ ] No inconsistent naming conventions (`name` field vs filename)
 - [ ] No conflicting statements between files
+
+**Required frontmatter format for all non-index files:**
+
+```yaml
+---
+type: project | user | feedback | reference
+status: active | archived | deprecated | needs-review
+updated: YYYY-MM-DD
+tags:
+  - tag1
+  - tag2
+---
+```
+
+**Risk levels:**
+- Missing `status`: **medium risk**
+- Missing `updated`: **medium risk**
+- Missing `type`: **medium risk**
+- Missing `tags`: **low risk**
+- Missing h2 heading: **medium risk**
+- MEMORY.md / index files may lack frontmatter but must pass index_validation
 
 For the file set as a whole, check:
 
@@ -103,16 +180,20 @@ Use the template in `templates/audit_report.md`. Must include:
 
 ```
 ## 操作记录
+## 模式与边界
 ## 审查结果总览
+## Blocked Files (if any)
 ## 一致性问题
-## 建议 Patch
+## Patch Intentions (Strict Local Audit) or Patch (Patch Mode)
 ## 需要人工确认的点
 ## 复盘
 ```
 
 ## 8. Patch Rule
 
-- All proposed modifications must be in unified diff format
+- In **Strict Local Audit** mode: only output **patch intentions** — describe what to change and why, without real paths or content
+- In **Patch Mode**: output unified diffs with real filenames, only within user-confirmed scope
+- In **Secure Redaction Mode**: do not output diffs that contain original secret values
 - Every diff must be accompanied by a rationale
 - No diffs are applied automatically — user must confirm each one
 - Each diff must be scoped to a single change (one concern per diff)
@@ -124,7 +205,28 @@ Execution **must stop immediately** and ask for user confirmation when:
 | Condition | Check |
 |-----------|-------|
 | File count > max-files | Script reports `stopped: true` |
-| Any file looks sensitive (API keys, secrets, PII) | Manual review required |
 | A file is too large (>50 KB) | Manual review required |
 | MEMORY.md index is not found | Cannot proceed without index |
 | Target directory does not exist | Cannot proceed |
+
+Sensitive content does **not** stop the audit — it blocks the affected file and continues.
+
+## 10. Post-governance Verification
+
+After any governance action (Patch Mode or Secure Redaction Mode), the audit must be re-run in Strict Local Audit mode as final verification.
+
+**Verification checklist:**
+- [ ] Re-run `python scripts/audit_memory.py --json`
+- [ ] All non-index files have `status`
+- [ ] All non-index files have `updated`
+- [ ] All non-index files have `tags`
+- [ ] All non-index files have at least one heading
+- [ ] index_validation: all resolved
+- [ ] No blocked files remaining
+- [ ] No high risk issues
+- [ ] No new issues introduced
+
+**Final verdict:**
+- **Pass**: No blocked files, no high risk, index fully resolved, all fields complete, no new issues
+- **Partial pass**: Only needs-review files remaining, or low-risk format issues only
+- **Fail**: Blocked files remain, high risk issues exist, index validation fails, or new sensitive risks appear

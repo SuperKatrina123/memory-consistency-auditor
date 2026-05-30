@@ -18,16 +18,36 @@
 
 ---
 
+## 模式与边界
+
+| 字段 | 值 |
+|------|-----|
+| 执行模式 | {{strict_local_audit / practical / patch_mode}} |
+| 真实文件名输出 | {{yes / no}} |
+| 原文输出 | {{yes / no}} |
+| Blocked Files | {{count}} |
+| Patch 状态 | {{intention_only / unified_diff_generated}} |
+
+---
+
 ## 审查结果总览
 
-| 文件代号 | 文件角色 | 状态 | 问题 | 风险 | 建议 |
-|----------|----------|------|------|------|------|
-| File A | {{role}} | {{status}} | {{issues_summary}} | {{risk_level}} | {{suggestion}} |
-| File B | {{role}} | {{status}} | {{issues_summary}} | {{risk_level}} | {{suggestion}} |
-| File C | {{role}} | {{status}} | {{issues_summary}} | {{risk_level}} | {{suggestion}} |
-| File D | {{role}} | {{status}} | {{issues_summary}} | {{risk_level}} | {{suggestion}} |
-| File E | {{role}} | {{status}} | {{issues_summary}} | {{risk_level}} | {{suggestion}} |
-| File F | {{role}} | {{status}} | {{issues_summary}} | {{risk_level}} | {{suggestion}} |
+| 文件代号 | 文件角色 | 状态 | 问题 | 风险 | 建议 | Blocked |
+|----------|----------|------|------|------|------|---------|
+| File A | {{role}} | {{status}} | {{issues_summary}} | {{risk_level}} | {{suggestion}} | {{yes/no}} |
+| File B | {{role}} | {{status}} | {{issues_summary}} | {{risk_level}} | {{suggestion}} | {{yes/no}} |
+| File C | {{role}} | {{status}} | {{issues_summary}} | {{risk_level}} | {{suggestion}} | {{yes/no}} |
+| File D | {{role}} | {{status}} | {{issues_summary}} | {{risk_level}} | {{suggestion}} | {{yes/no}} |
+| File E | {{role}} | {{status}} | {{issues_summary}} | {{risk_level}} | {{suggestion}} | {{yes/no}} |
+| File F | {{role}} | {{status}} | {{issues_summary}} | {{risk_level}} | {{suggestion}} | {{yes/no}} |
+
+---
+
+## Blocked Files
+
+| 文件代号 | 原因 | 处理方式 |
+|----------|------|----------|
+| {{file_code}} | Sensitive pattern detected (API key / token / credential) | 不输出匹配内容，不输出上下文原文，不为该文件生成 patch。需人工确认后解除 block。 |
 
 ---
 
@@ -45,6 +65,17 @@
 |----------|----------|----------|------|
 | {{file_code}} | {{index_says}} | {{actual}} | {{gap}} |
 
+**Index Validation (local resolve):**
+| 指标 | 数值 |
+|------|------|
+| 索引文件 | {{File A / other}} |
+| 链接数 | {{count}} |
+| 可解析 | {{count}} |
+| 缺失 | {{count}} |
+| 歧义 | {{count}} |
+| 无法解析 | {{count}} |
+| 风险等级 | {{low / medium / high}} |
+
 ### 3. 文件间冲突
 
 | 涉及文件 | 冲突描述 | 建议 |
@@ -53,9 +84,9 @@
 
 ### 4. 格式不统一
 
-| 文件代号 | 字段 | 当前值 | 建议值 |
-|----------|------|--------|--------|
-| {{file_code}} | {{field_name}} | {{current}} | {{suggested}} |
+| 文件代号 | 字段 | 当前值 | 风险 | 建议值 |
+|----------|------|--------|------|--------|
+| {{file_code}} | {{field_name}} | {{current}} | {{low/medium/high}} | {{suggested}} |
 
 ### 5. 冗余或可合并内容
 
@@ -65,7 +96,31 @@
 
 ---
 
-## 建议 Patch
+## Patch Intentions
+
+（Strict Local Audit 模式下仅输出修改意图，不输出真实文件路径和原文。）
+
+### Patch Intention 1: {{description}}
+
+- **目标文件:** {{file_code}}
+- **修改类型:** field update / rename / restructure
+- **原因:** {{rationale}}
+- **具体操作:** {{what_to_change_without_exposing_content}}
+
+---
+
+### Patch Intention 2: {{description}}
+
+- **目标文件:** {{file_code}}
+- **修改类型:** field update / rename / restructure
+- **原因:** {{rationale}}
+- **具体操作:** {{what_to_change_without_exposing_content}}
+
+---
+
+## Patch
+
+（仅 Patch Mode 输出。Strict Local Audit 模式下此项不启用。）
 
 ### Patch 1: {{description}}
 
@@ -95,11 +150,40 @@
 
 ---
 
+## Secure Redaction Mode Note
+
+（如果本次审计涉及 blocked 文件处理，在此注明。）
+
+| 文件代号 | 处理方式 | 验证结果 |
+|----------|----------|----------|
+| {{file_code}} | redact / remove-block / manual | block cleared / pending |
+
+注意：不输出原始敏感内容、不输出匹配行、不输出上下文。
+
+---
+
 ## 需要人工确认的点
 
 1. {{confirmation_point_1}}
 2. {{confirmation_point_2}}
 3. {{confirmation_point_3}}
+
+---
+
+## 治理验收
+
+| 检查项 | 结果 |
+|---|---|
+| 所有非索引文件有 status | {{yes/no}} |
+| 所有非索引文件有 updated | {{yes/no}} |
+| 所有非索引文件有 tags | {{yes/no}} |
+| 所有非索引文件有 h2 标题 | {{yes/no}} |
+| index_validation 全部 resolved | {{yes/no}} |
+| 无 blocked 文件 | {{yes/no}} |
+| 无 high risk 问题 | {{yes/no}} |
+| 无新增问题 | {{yes/no}} |
+
+**验收结论:** {{pass / partial pass / fail}}
 
 ---
 

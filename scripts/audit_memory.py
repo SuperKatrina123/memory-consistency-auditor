@@ -33,6 +33,7 @@ SENSITIVE_PATTERNS: list[str] = [
     r"(?i)(api[_-]?key|secret|password|token|credential)[\s=:]*['\"]?[A-Za-z0-9_\-\.]{8,}",
     r"(?i)sk-[A-Za-z0-9]{20,}",
     r"(?i)AIza[0-9A-Za9\-_]{35}",
+    r"(?i)\.env\.local",
 ]
 MAX_HEADINGS_SAMPLE = 8
 MAX_HEADING_LENGTH = 80
@@ -74,7 +75,6 @@ def extract_frontmatter(text: str) -> tuple[dict[str, str], int]:
         if ":" in line:
             key, _, val = line.partition(":")
             fm[key.strip()] = val.strip().strip('"').strip("'")
-    # Count lines consumed (including opening and closing ---)
     lines_consumed = 2 + block.count("\n")
     return fm, lines_consumed
 
@@ -90,28 +90,37 @@ def extract_headings(text: str, body_start: int) -> list[str]:
     return result
 
 
-def extract_links(text: str) -> tuple[int, int]:
-    md_links = len(re.findall(r"\[([^\]]+)\]\(([^)]+)\)", text))
-    wiki_links = len(re.findall(r"\[\[([^\]]+)\]\]", text))
-    return md_links, wiki_links
+def extract_links(text: str) -> list[tuple[str, str]]:
+    """Extract markdown links and wiki links.
+    Returns list of (link_text, link_target) tuples.
+    For wiki links [[target]], link_text is empty.
+    """
+    links: list[tuple[str, str]] = []
+    # Markdown links: [text](target)
+    for m in re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", text):
+        links.append((m.group(1), m.group(2)))
+    # Wiki links: [[target]]
+    for m in re.finditer(r"\[\[([^\]]+)\]\]", text):
+        links.append(("", m.group(1)))
+    return links
 
 
-def check_sensitive(text: str, filename: str) -> list[str]:
+def check_sensitive(text: str) -> list[str]:
     """Check for sensitive content patterns.
     Returns list of issue descriptions (without revealing the match).
+    Returns empty list if no sensitive patterns found.
     """
     issues = []
     for pattern in SENSITIVE_PATTERNS:
         matches = re.findall(pattern, text)
         if matches:
-            # Count unique lines where matches occur to estimate scope
             lines_matched = set()
             for m in re.finditer(pattern, text):
                 line_num = text[: m.start()].count("\n") + 1
                 lines_matched.add(line_num)
             issues.append(
-                f"Sensitive pattern detected in {filename}: "
-                f"matched '{pattern}' on {len(lines_matched)} line(s)"
+                f"Sensitive pattern detected: matched "
+                f"on {len(lines_matched)} line(s)"
             )
     return issues
 
@@ -133,6 +142,55 @@ def check_heading_hierarchy(headings: list[str]) -> list[str]:
     return issues
 
 
+def resolve_index_links(
+    index_text: str, mdfiles: list[Path], include_filenames: bool
+) -> dict:
+    """Resolve links from the index file against actual files.
+    Returns structured result without exposing real names in strict mode.
+    """
+    links = extract_links(index_text)
+    md_link_targets = [target for _, target in links if target.endswith(".md")]
+    existing_filenames = {f.name for f in mdfiles}
+
+    resolved = 0
+    missing = 0
+    ambiguous = 0
+    unresolved = 0
+    unresolved_targets: list[str] = []
+
+    for target in md_link_targets:
+        target_clean = target.split("#")[0].split("?")[0]  # strip anchor/query
+        if not target_clean:
+            continue
+        if target_clean in existing_filenames:
+            resolved += 1
+        else:
+            # Try matching without extension or with partial name
+            candidates = [f for f in existing_filenames if target_clean in f]
+            if len(candidates) == 0:
+                missing += 1
+                unresolved_targets.append(target_clean)
+            elif len(candidates) == 1:
+                resolved += 1
+            else:
+                ambiguous += 1
+                unresolved_targets.append(target_clean)
+
+    result: dict = {
+        "link_count": len(md_link_targets),
+        "resolved_count": resolved,
+        "missing_count": missing,
+        "ambiguous_count": ambiguous,
+        "unresolved_count": missing + ambiguous,
+    }
+
+    if not include_filenames:
+        # Do not expose real link targets
+        pass
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Main audit logic
 # ---------------------------------------------------------------------------
@@ -150,6 +208,8 @@ def audit_directory(
         "stopped": False,
         "stop_reason": None,
         "files": [],
+        "blocked_files": [],
+        "index_validation": None,
         "global_issues": [],
     }
 
@@ -168,7 +228,6 @@ def audit_directory(
             f"Found {len(mdfiles)} .md files (limit: {max_files}). "
             "Manual confirmation required before proceeding."
         )
-        # Still include basic info about what was found
         for i, f in enumerate(mdfiles):
             entry: dict = {
                 "file_code": file_code(i),
@@ -186,6 +245,7 @@ def audit_directory(
                 "headings_sample": [],
                 "markdown_link_count": 0,
                 "wiki_link_count": 0,
+                "blocked": False,
                 "issue_candidates": [
                     "Exceeded max-files limit — review skipped"
                 ],
@@ -195,6 +255,27 @@ def audit_directory(
             result["files"].append(entry)
         return result
 
+    # --- Identify index file ---
+    index_file: Path | None = None
+    for f in mdfiles:
+        if f.name == "MEMORY.md":
+            index_file = f
+            break
+    if index_file is None:
+        for f in mdfiles:
+            raw_preview = f.read_text(encoding="utf-8")
+            fm, _ = extract_frontmatter(raw_preview)
+            if fm.get("type", "").lower() == "index":
+                index_file = f
+                break
+
+    index_file_code: str | None = None
+    for i, f in enumerate(mdfiles):
+        if f == index_file:
+            index_file_code = file_code(i)
+            break
+
+    # --- Scan each file ---
     for i, f in enumerate(mdfiles):
         entry: dict = {
             "file_code": file_code(i),
@@ -212,6 +293,7 @@ def audit_directory(
             "headings_sample": [],
             "markdown_link_count": 0,
             "wiki_link_count": 0,
+            "blocked": False,
             "issue_candidates": [],
         }
         if include_filenames:
@@ -229,19 +311,51 @@ def audit_directory(
                 f"{LARGE_FILE_THRESHOLD / 1024:.0f} KB limit)"
             )
 
-        # Extract frontmatter
+        # --- Sensitive content check (before any content processing) ---
+        sensitive_issues = check_sensitive(raw)
+        is_sensitive = len(sensitive_issues) > 0
+
+        if is_sensitive:
+            entry["blocked"] = True
+            # Add blocking issue without revealing matched content
+            issues.append(
+                "BLOCKED: Sensitive pattern detected (API key / token / secret / credential). "
+                "No patch will be generated for this file."
+            )
+            result["blocked_files"].append(
+                {
+                    "file_code": file_code(i),
+                    "reason": "Sensitive pattern detected",
+                }
+            )
+
+        # --- Frontmatter extraction ---
         fm, body_start = extract_frontmatter(raw)
+
+        # Identify role: MEMORY.md or type=index → index role
+        is_index_role = (
+            f.name == "MEMORY.md"
+            or fm.get("type", "").lower() == "index"
+        )
+        if is_index_role:
+            entry["type"] = "index"
+
         entry["frontmatter_keys"] = list(fm.keys())
-        if not fm:
+
+        if not fm and not is_index_role:
             issues.append("Missing frontmatter")
-        else:
-            # Check required keys
-            for key in ("name", "description", "type"):
-                if key not in fm:
-                    issues.append(f"Missing required frontmatter key: {key}")
+        elif fm:
+            # Required key checks (only for non-index files)
+            if not is_index_role:
+                for key in ("type", "status", "updated"):
+                    if key not in fm:
+                        risk = "low" if key == "tags" else "medium"
+                        issues.append(
+                            f"Missing required frontmatter key: '{key}'"
+                        )
 
             # Type validation
-            valid_types = {"user", "feedback", "project", "reference"}
+            valid_types = {"user", "feedback", "project", "reference", "index"}
             fm_type = fm.get("type", "").lower()
             if fm_type:
                 entry["type"] = fm_type
@@ -250,89 +364,79 @@ def audit_directory(
                         f"Invalid type '{fm_type}'; "
                         f"expected one of {valid_types}"
                     )
-            else:
+            elif not is_index_role:
                 issues.append("Missing 'type' in frontmatter")
 
             entry["status"] = fm.get("status", "unknown")
             entry["updated"] = fm.get("updated", None)
-            entry["tags"] = [
-                t.strip() for t in fm.get("tags", "").split(",") if t.strip()
-            ]
+
+            # Tags check
+            tags_raw = fm.get("tags", "")
+            if tags_raw.startswith("["):
+                tags_raw = tags_raw.strip("[]").replace('"', "").replace("'", "")
+            entry["tags"] = [t.strip() for t in tags_raw.split(",") if t.strip()]
 
             # Staleness check
-            if entry.get("status") in ("active", "current") and not entry.get(
-                "updated"
-            ):
+            if entry.get("status") in ("active", "current") and not entry.get("updated"):
                 issues.append(
                     "Status is 'active/current' but no 'updated' field"
                 )
 
-            # Parse tags from frontmatter (could be YAML list or comma-sep)
-            tags_raw = fm.get("tags", "")
-            if tags_raw.startswith("["):
-                tags_raw = tags_raw.strip("[]").replace('"', "").replace(
-                    "'", ""
-                )
-            entry["tags"] = [t.strip() for t in tags_raw.split(",") if t.strip()]
+        # --- Heading analysis (skip if blocked) ---
+        if not is_sensitive:
+            headings = extract_headings(raw, body_start)
+            entry["heading_count"] = len(headings)
+            entry["headings_sample"] = headings[:MAX_HEADINGS_SAMPLE]
 
-        # Check for sensitive content
-        sensitive_issues = check_sensitive(raw, f.name)
-        issues.extend(sensitive_issues)
+            if not headings and not is_index_role:
+                issues.append("File has no headings")
+            else:
+                hierarchy_issues = check_heading_hierarchy(headings)
+                issues.extend(hierarchy_issues)
 
-        # Heading analysis
-        headings = extract_headings(raw, body_start)
-        entry["heading_count"] = len(headings)
-        entry["headings_sample"] = headings[:MAX_HEADINGS_SAMPLE]
+        # --- Link analysis ---
+        links = extract_links(raw)
+        if not is_sensitive:
+            entry["markdown_link_count"] = sum(
+                1 for _, target in links if not target.startswith("[[")
+            )
+            entry["wiki_link_count"] = sum(
+                1 for _, target in links if target.startswith("[[")
+            )
 
-        if not headings:
-            issues.append("File has no headings")
-        else:
-            hierarchy_issues = check_heading_hierarchy(headings)
-            issues.extend(hierarchy_issues)
-
-        # Link analysis
-        md_links, wiki_links = extract_links(raw)
-        entry["markdown_link_count"] = md_links
-        entry["wiki_link_count"] = wiki_links
-
-        # Index file check: MEMORY.md should have links
-        if f.name == "MEMORY.md" and md_links == 0 and wiki_links == 0:
-            issues.append("Index file (MEMORY.md) has no links")
+        # Index file check: should have links
+        if is_index_role and not links:
+            issues.append("Index file has no links")
 
         entry["issue_candidates"] = issues
         result["files"].append(entry)
 
-    # Global index analysis
-    mem_index = None
-    for f in mdfiles:
-        if f.name == "MEMORY.md":
-            mem_index = f
-            break
-    if mem_index is None:
-        result["global_issues"].append("No MEMORY.md index file found")
+    # --- Index validation ---
+    if index_file is not None:
+        index_text = index_file.read_text(encoding="utf-8")
+        index_validation = resolve_index_links(index_text, mdfiles, include_filenames)
+        index_validation["index_file"] = index_file_code or "unknown"
+        result["index_validation"] = index_validation
+
+        if index_validation["missing_count"] > 0 or index_validation["ambiguous_count"] > 0:
+            result["global_issues"].append(
+                f"Index link resolution: {index_validation['missing_count']} missing, "
+                f"{index_validation['ambiguous_count']} ambiguous — medium risk"
+            )
     else:
-        # Check each file has a corresponding index entry
-        mem_text = mem_index.read_text(encoding="utf-8")
+        result["global_issues"].append("No index file (MEMORY.md or type=index) found")
+
+    # --- Global orphan check ---
+    if include_filenames and index_file is not None:
+        index_text = index_file.read_text(encoding="utf-8")
         for entry in result["files"]:
-            if entry["file_code"] == file_code(
-                next(
-                    i
-                    for i, f in enumerate(mdfiles)
-                    if f.name == "MEMORY.md"
-                )
-            ):
+            if entry["file_code"] == index_file_code:
                 continue
-            if include_filenames:
-                filename = entry.get("filename", "")
-            else:
-                # Use path_hash to correlate
-                filename = None
-            # Simple check: filename appears in MEMORY.md
-            if include_filenames and filename:
-                if filename not in mem_text:
-                    entry["issue_candidates"].append(
-                        f"File '{filename}' not referenced in MEMORY.md index"
-                    )
+            filename = entry.get("filename", "")
+            if filename and filename not in index_text:
+                entry["issue_candidates"].append(
+                    f"File '{filename}' not referenced in index"
+                )
 
     return result
 
@@ -385,9 +489,23 @@ def main() -> None:
         if report["stopped"]:
             print(f"STOPPED: {report['stop_reason']}")
         else:
+            if report["index_validation"]:
+                iv = report["index_validation"]
+                print(f"\nIndex Validation:")
+                print(f"  Index file: {iv['index_file']}")
+                print(f"  Links: {iv['link_count']}")
+                print(f"  Resolved: {iv['resolved_count']}")
+                print(f"  Missing: {iv['missing_count']}")
+                print(f"  Ambiguous: {iv['ambiguous_count']}")
+            if report["blocked_files"]:
+                print(f"\nBlocked Files:")
+                for bf in report["blocked_files"]:
+                    print(f"  ⛔ {bf['file_code']}: {bf['reason']}")
             print(f"\nFiles:")
             for entry in report["files"]:
                 print(f"  {entry['file_code']}")
+                if entry["blocked"]:
+                    print(f"    ⛔ BLOCKED")
                 print(f"    Size: {entry['size_bytes']} bytes")
                 print(f"    Modified: {entry['modified_at']}")
                 print(f"    Type: {entry['type']}")
